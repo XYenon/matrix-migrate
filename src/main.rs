@@ -49,6 +49,10 @@ struct Args {
     #[arg(long, env = "TO_HOMESERVER")]
     to_homeserver: Option<OwnedServerName>,
 
+    // Whether to include direct chats
+    #[arg(long, env = "INCLUDE_DIRECT", default_value = "false")]
+    include_direct: bool,
+
     /// Custom logging info
     #[arg(long, env = "RUST_LOG", default_value = "matrix_migrate=info")]
     log: String,
@@ -102,6 +106,7 @@ async fn main() -> anyhow::Result<()> {
     let all_prev_rooms = from_c
         .joined_rooms()
         .into_iter()
+        .filter(|r| args.include_direct || !r.is_direct())
         .map(|r| r.room_id().to_owned())
         .collect::<Vec<_>>();
 
