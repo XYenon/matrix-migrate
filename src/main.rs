@@ -1,3 +1,6 @@
+use std::collections::{HashMap, HashSet};
+use std::io;
+use std::net::SocketAddr;
 use std::time::Duration;
 
 use clap::Parser;
@@ -5,12 +8,18 @@ use futures::{
     future::{join_all, try_join_all},
     pin_mut, try_join, StreamExt,
 };
-use log::{info, warn};
+use hyper::server::conn::http1;
+use hyper::service::service_fn;
+use hyper::{Request, Response, StatusCode};
+use log::{debug, error, info, warn};
+use matrix_sdk::ruma::api::client::session::get_login_types::v3::LoginType;
 use matrix_sdk::{
     config::SyncSettings,
     ruma::{OwnedRoomId, OwnedServerName, OwnedUserId},
     Client,
 };
+use tokio::net::TcpListener;
+use tokio::sync::mpsc::channel;
 
 /// Fast migration of one matrix account to another
 #[derive(Parser, Debug)]
@@ -22,7 +31,7 @@ struct Args {
 
     /// Password of the account to migrate from
     #[arg(long = "from-pw", env = "FROM_PASSWORD")]
-    from_user_password: String,
+    from_user_password: Option<String>,
 
     /// Custom homeserver, if not defined discovery is used
     #[arg(long, env = "FROM_HOMESERVER")]
@@ -34,7 +43,7 @@ struct Args {
 
     /// Password of the account to migrate from
     #[arg(long = "to-pw", env = "TO_PASSWORD")]
-    to_user_password: String,
+    to_user_password: Option<String>,
 
     /// Custom homeserver, if not defined discovery is used
     #[arg(long, env = "TO_HOMESERVER")]
@@ -62,10 +71,7 @@ async fn main() -> anyhow::Result<()> {
 
     info!("Logging in {:}", args.from_user);
 
-    from_c
-        .login_username(args.from_user, &args.from_user_password)
-        .send()
-        .await?;
+    login(&from_c, args.from_user, args.from_user_password).await?;
 
     let to_cb = Client::builder().user_agent("matrix-migrate/1");
     let to_c = if let Some(h) = args.to_homeserver {
@@ -79,9 +85,7 @@ async fn main() -> anyhow::Result<()> {
 
     info!("Logging in {:}", args.to_user);
 
-    to_c.login_username(args.to_user, &args.to_user_password)
-        .send()
-        .await?;
+    login(&to_c, args.to_user, args.to_user_password).await?;
 
     info!("All logged in. Syncing...");
 
@@ -188,6 +192,110 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn login(c: &Client, user: OwnedUserId, password: Option<String>) -> anyhow::Result<()> {
+    if let Some(p) = password {
+        info!("Logging in with password");
+        c.login_username(user, &p).send().await?;
+    } else {
+        info!("Logging in with SSO");
+        sso_login(c).await?;
+    }
+    return Ok(());
+}
+
+async fn sso_login(c: &Client) -> anyhow::Result<()> {
+    let login_types = c.get_login_types().await?.flows;
+    let sso = login_types
+        .iter()
+        .find(|f| matches!(f, LoginType::Sso(_)))
+        .expect("No SSO login type found");
+    if let LoginType::Sso(sso_login_type) = sso {
+        info!("Found multiple SSO providers. Please select one:");
+        let identity_providers = &sso_login_type.identity_providers;
+        let mut identity_provider_ids = HashSet::with_capacity(identity_providers.len());
+        identity_providers.iter().for_each(|idp| {
+            info!("\tid: {:<25}name: {}", idp.id, idp.name);
+            identity_provider_ids.insert(idp.id.as_str());
+        });
+        let mut selected_identity_provider_id = String::new();
+        if identity_provider_ids.len() == 1 {
+            debug!("Only one SSO provider found. Using that one.");
+            selected_identity_provider_id = identity_providers[0].id.to_string();
+        } else {
+            let stdin = io::stdin();
+            while !identity_provider_ids.contains(selected_identity_provider_id.trim()) {
+                info!("Please enter the id of the SSO provider you want to use:");
+                selected_identity_provider_id.clear();
+                stdin.read_line(&mut selected_identity_provider_id)?;
+            }
+        }
+
+        let addr = SocketAddr::from(([127, 0, 0, 1], 0));
+        let listener = TcpListener::bind(addr).await?;
+        let base_url = format!("http://{}", listener.local_addr()?);
+        debug!("Listening on {}", base_url);
+
+        let sso_login_url = c
+            .get_sso_login_url(
+                base_url.as_str(),
+                Some(selected_identity_provider_id.trim()),
+            )
+            .await?;
+        info!("Please open the following URL in your browser and login:");
+        info!("{}", sso_login_url);
+
+        let (sender, mut receiver) = channel(1);
+
+        let service = service_fn(move |req: Request<hyper::body::Incoming>| {
+            let sender = sender.clone();
+            async move {
+                debug!("Got request: {:?}", req);
+                let mut resp = Response::new(String::new());
+                if req.uri().path() != "/" {
+                    *resp.status_mut() = StatusCode::NOT_FOUND;
+                    return Ok::<_, String>(resp);
+                }
+                let hash_query: HashMap<_, _> = req
+                    .uri()
+                    .query()
+                    .map(|v| {
+                        url::form_urlencoded::parse(v.as_bytes())
+                            .into_owned()
+                            .collect()
+                    })
+                    .unwrap_or_else(HashMap::new);
+                if let Some(token) = hash_query.get("loginToken") {
+                    debug!("Got login token: {}", token);
+                    if let Err(_) = sender.send(token.to_string()).await {
+                        error!("Failed to send login token");
+                    }
+                } else {
+                    error!("No login token found in query string");
+                }
+                *resp.status_mut() = StatusCode::NO_CONTENT;
+                return Ok(resp);
+            }
+        });
+        let (stream, _) = listener.accept().await?;
+        let server = tokio::task::spawn(async move {
+            if let Err(err) = http1::Builder::new()
+                .serve_connection(stream, service)
+                .await
+            {
+                error!("Error serving connection: {:?}", err);
+            }
+        });
+
+        if let Some(token) = receiver.recv().await {
+            server.abort();
+            c.login_token(&token).send().await?;
+        } else {
+            anyhow::bail!("No login token found");
+        }
+    }
+    return Ok(());
+}
+
 async fn ensure_power_levels(
     from_c: &Client,
     new_username: OwnedUserId,
@@ -254,7 +362,9 @@ async fn accept_invites(
             invited.display_name().await?,
             invited.room_id()
         );
-        invited.accept_invitation().await?;
+        if let Err(err) = invited.accept_invitation().await {
+            error!("Error accepting invitation: {:?}", err);
+        };
     }
 
     Ok(pending)
